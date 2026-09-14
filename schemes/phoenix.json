@@ -11,7 +11,7 @@
     "number_contigs": "#_of_Scaffolds_>500bp",
     "gc_ratio": "GC_%",
     "species": ["Species", "Final_Taxa_ID"],
-    "species_confidence": "Taxa_Confidence",
+    "species_confidence": ["Taxa_Confidence", "FastANI_%ID"],
     "subtype_1": "MLST_1",
     "subtype_2": "MLST_2", 
     "amr_genes_beta_lactam": "GAMMA_Beta_Lactam_Resistance_Genes",
