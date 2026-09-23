@@ -1,6 +1,6 @@
 Metadata-Version: 2.1
 Name: waphl-data
-Version: 2.1.2
+Version: 2.1.3
 Requires-Python: >=3.11
 Requires-Dist: streamlit>=1.55
 Requires-Dist: pandas>=2.2

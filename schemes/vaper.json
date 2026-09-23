@@ -19,7 +19,10 @@
     }
   ],
   "reportable_files": [
-    { "pattern": "execution_report_*",  "type": "log" },
+    {
+      "pattern": ["multiqc_report.html", "execution_report_*"],
+      "type": "log"
+    },
     { "pattern": "*.fa.gz",             "type": "assembly" },
     { "pattern": "VAPER-summary.csv",   "type": "summary" }
   ]

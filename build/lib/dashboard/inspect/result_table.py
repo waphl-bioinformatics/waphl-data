@@ -18,6 +18,11 @@ from dashboard.inspect import workflow_specific_functions as wsf
 # ---------- GLOBALS ----------
 BASE_COLS = ["accept", "reject", "id_alt", "run", "workflow_alt"]
 
+# File types that belong to exactly one sample. These must never be filled from
+# run-level (id_alt == "") files: doing so hands every sample that lacks its own
+# file ALL of the run's unassigned files, i.e. other samples' assemblies.
+SAMPLE_SCOPED_TYPES = {"assembly", "raw_reads"}
+
 def apply_qc_row(row: pd.Series, criteria: List[Dict[str, Any]]) -> bool:
     """Return True if row passes all numeric min/max rules."""
 
@@ -105,7 +110,7 @@ def build_rows() -> pd.DataFrame:
     # reportable files (in which case it just gets NaN for every file type).
     all_samples = df[df["id_alt"] != ""][["id", "id_alt", "run"]].drop_duplicates()
 
-    warnings = []
+    missing_by_sample = {}
     final_rows = []
     for _, srow in all_samples.iterrows():
         sid, id_alt, run = srow["id"], srow["id_alt"], srow["run"]
@@ -113,7 +118,10 @@ def build_rows() -> pd.DataFrame:
         row = {"id": sid, "id_alt": id_alt, "run": run}
         missing = []
         for ft in file_types:
-            files = type_to_file.get(ft) or global_lookup.get((run, ft)) or []
+            files = type_to_file.get(ft)
+            if not files and ft not in SAMPLE_SCOPED_TYPES:
+                files = global_lookup.get((run, ft))
+            files = files or []
             if not files:
                 missing.append(ft)
                 row[ft] = np.nan
@@ -130,17 +138,42 @@ def build_rows() -> pd.DataFrame:
             else:
                 row[ft] = list(files)   # one or more paths
         if missing:
-            warnings.append(
-                f"{sid!r}: {', '.join(missing)}"
-            )
+            missing_by_sample[(sid, id_alt, run)] = missing
         final_rows.append(row)
+
+    df_grouped = pd.DataFrame(final_rows, columns=out_cols)
+
+    # Workflow-specific exemptions: file types a sample legitimately won't have.
+    if st.session_state.get("inspect_workflow") == "vaper":
+        missing_by_sample = wsf.vaper_drop_unexpected_missing(missing_by_sample, df_grouped)
+
+    warnings = [
+        f"{sid!r}: {', '.join(missing)}"
+        for (sid, _, _), missing in missing_by_sample.items()
+        if missing
+    ]
     if warnings:
         ui.push_message(
             "Some samples are missing reportable file types:\n\n" + "\n\n".join(warnings),
             type="warning",
         )
 
-    st.session_state["df_grouped"] = pd.DataFrame(final_rows, columns=out_cols)
+    # Per-sample files the gather step couldn't assign to a sample. They are no
+    # longer spread across samples, so surface them instead of dropping silently.
+    orphans = [
+        f"{run!r}: {f}"
+        for (run, ft), files in global_lookup.items()
+        if ft in SAMPLE_SCOPED_TYPES
+        for f in files
+    ]
+    if orphans:
+        ui.push_message(
+            "These per-sample files have no sample id and were not attached to any row:\n\n"
+            + "\n\n".join(orphans),
+            type="warning",
+        )
+
+    st.session_state["df_grouped"] = df_grouped
 
 def add_summary_columns():
     """Add summary columns to the grouped frame."""
@@ -191,33 +224,40 @@ def add_summary_columns():
     # Strip a trailing "_T<number>" suffix from the summary's id column
     # (e.g. "SAMPLE123_T1" -> "SAMPLE123") so it matches df_grouped's id.
     if "id" in df_summary.columns:
+        df_summary["_id_raw"] = df_summary["id"].astype(str)
         df_summary["id"] = (
             df_summary["id"]
             .astype(str)
             .str.replace(r"_T\d+$", "", regex=True)
         )
 
-    merge_keys = ["id", "summary"]
     if workflow == "vaper":
-        df = wsf.process_vaper(df)
-        merge_keys.append("reference")
-
-    missing_keys = [k for k in merge_keys if k not in df_summary.columns]
-    if missing_keys:
-        ui.push_message(
-            f"Summary tables are missing merge column(s): {', '.join(missing_keys)}. "
-            f"Columns found: {', '.join(map(str, df_summary.columns))}. "
-            "Check the scheme's summary_columns mapping. Skipping summary merge.",
-            type="warning",
+        missing_keys = [k for k in ("id", "reference") if k not in df_summary.columns]
+        if missing_keys:
+            ui.push_message(
+                f"VAPER summary is missing column(s): {', '.join(missing_keys)}. "
+                f"Columns found: {', '.join(map(str, df_summary.columns))}. Skipping summary merge.",
+                type="warning",
+            )
+            return
+        df_merged = wsf.merge_vaper(df, df_summary)
+    else:
+        merge_keys = ["id", "summary"]
+        missing_keys = [k for k in merge_keys if k not in df_summary.columns]
+        if missing_keys:
+            ui.push_message(
+                f"Summary tables are missing merge column(s): {', '.join(missing_keys)}. "
+                f"Columns found: {', '.join(map(str, df_summary.columns))}. "
+                "Check the scheme's summary_columns mapping. Skipping summary merge.",
+                type="warning",
+            )
+            return
+        df_merged = df.merge(
+            df_summary.drop(columns="_id_raw", errors="ignore"),
+            on=merge_keys,
+            how="left",
+            suffixes=("", "_summary"),
         )
-        return
-
-    df_merged = df.merge(
-        df_summary,
-        on=merge_keys,
-        how="left",
-        suffixes=("", "_summary")
-    )
 
     # ---- ensure BASE_COLS fields exist before selecting output columns ----
     # workflow_alt: prefer a per-sample value carried on df_processed (joined on
@@ -244,10 +284,14 @@ def add_summary_columns():
     if "reject" not in df_merged.columns:
         df_merged["reject"] = pd.NA
 
-    keep_cols = ["id"] + BASE_COLS + list(summary_columns.keys()) + file_types
+    extra_cols = ["reference"] if workflow == "vaper" else []
+    keep_cols = ["id"] + BASE_COLS + list(summary_columns.keys()) + extra_cols + file_types
     seen = set()
     keep_cols = [c for c in keep_cols if not (c in seen or seen.add(c))]
 
+    for c in keep_cols:
+        if c not in df_merged.columns:
+            df_merged[c] = pd.NA
     df_merged = df_merged[keep_cols]
 
     st.session_state["df_results"] = df_merged

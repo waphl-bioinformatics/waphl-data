@@ -218,9 +218,57 @@ def write_delta(
             log_print(f"Delta commit conflict at {uri}, retrying in {sleep_s:.1f}s (attempt {attempt}/{max_retries})")
             time.sleep(sleep_s)
 
+_FILTER_OPS = {
+    "=":      lambda s, v: s == v,
+    "==":     lambda s, v: s == v,
+    "!=":     lambda s, v: s != v,
+    "<":      lambda s, v: s < v,
+    "<=":     lambda s, v: s <= v,
+    ">":      lambda s, v: s > v,
+    ">=":     lambda s, v: s >= v,
+    "in":     lambda s, v: s.isin(list(v)),
+    "not in": lambda s, v: ~s.isin(list(v)),
+}
+
+
 def read_delta_as_pandas(uri, filters=None, columns=None, storage_options=None):
+    """
+    Read a Delta table into pandas with DNF-style filters [(col, op, value), ...].
+
+    Only partition-column filters are pushed down to deltalake. Filters on
+    regular columns are applied in pandas after the read: files written by a
+    deltalake MERGE (DataFusion) store strings as string_view, and pyarrow's
+    dataset filter can't compare those against a plain string literal
+    ("Function 'equal' has no kernel matching input types (string, string_view)").
+    """
     dt = DeltaTable(uri, storage_options=storage_options)
-    return dt.to_pandas(filters=filters, columns=columns)
+    filters = [tuple(f) for f in (filters or [])]
+
+    partition_cols = set(dt.metadata().partition_columns)
+    part_filters = [f for f in filters if f[0] in partition_cols]
+    row_filters = [f for f in filters if f[0] not in partition_cols]
+
+    for col, op, _ in row_filters:
+        if op not in _FILTER_OPS:
+            raise ValueError(f"Unsupported filter operator {op!r} on column {col!r}")
+
+    read_cols = None
+    if columns:
+        read_cols = list(dict.fromkeys(list(columns) + [c for c, _, _ in row_filters]))
+
+    df = dt.to_pandas(filters=part_filters or None, columns=read_cols)
+
+    if row_filters:
+        mask = pd.Series(True, index=df.index)
+        for col, op, val in row_filters:
+            if col not in df.columns:
+                raise ValueError(f"Filter column {col!r} not found in table")
+            mask &= _FILTER_OPS[op](df[col], val).fillna(False).astype(bool)
+        df = df[mask].reset_index(drop=True)
+
+    if columns:
+        df = df[list(columns)]
+    return df
 
 def delta_partition_values(uri, partition_col, storage_options=None):
     dt = DeltaTable(uri, storage_options=storage_options)
@@ -285,4 +333,3 @@ def s3_file_exists(bucket: str, key: str) -> bool:
             return False
         # Re-raise other errors (e.g., permission issues)
         raise
-

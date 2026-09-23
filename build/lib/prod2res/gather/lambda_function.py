@@ -58,7 +58,12 @@ def check_file(bucket: str, key: str, fail: bool = True, message: bool = True) -
         raise
 
 def list_keys(bucket: str, prefix: str) -> Dict[str, int]:
-    """Return {key: last_modified_epoch} for non-directory objects under prefix."""
+    """Return {key: last_modified_epoch} for non-directory objects under prefix.
+
+    S3 prefixes are plain string matches, so "runs/VSP025" would also list
+    "runs/VSP025B/...". The trailing slash limits the listing to that directory.
+    """
+    prefix = prefix.rstrip("/") + "/"
     log_print(f"Listing s3://{bucket}/{prefix}")
     paginator = S3.get_paginator("list_objects_v2")
     out: Dict[str, int] = {}
